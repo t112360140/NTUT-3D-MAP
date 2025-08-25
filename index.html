@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Three.js AR Demo</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        canvas { display: block; }
+        #status-box {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+            color: white;
+            padding: 10px;
+            text-align: center;
+            font-family: sans-serif;
+            font-size: 14px;
+            box-sizing: border-box;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <div id="status-box">正在初始化...</div>
+    
+    <div id="permission-overlay" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); color: white; z-index: 20; display: flex; justify-content: center; align-items: center; text-align: center; flex-direction: column;">
+        <h2>需要您的授權</h2>
+        <p>為了啟用AR體驗，請允許我們存取裝置的動作與方向感測器。</p>
+        <button id="permission-btn" style="padding: 10px 20px; font-size: 16px;">開始體驗</button>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
+    <script>
+        // --- 初始設定 ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setClearColor(0x87ceeb);
+        document.body.appendChild(renderer.domElement);
+        
+        // --- 控制模式相關變數 ---
+        let controlMode = 'gyro';
+        let isDragging = false;
+        let previousPointerPosition = { x: 0, y: 0 };
+        const PI_2 = Math.PI / 2;
+
+        // --- 建立相機控制結構 ---
+        const yawObject = new THREE.Object3D();
+        yawObject.position.y = 1.8;
+        scene.add(yawObject);
+        yawObject.add(camera);
+
+        const statusBox = document.getElementById('status-box');
+        function updateStatus(message) {
+            console.log(message);
+            statusBox.textContent = message;
+        }
+
+        // --- STL 模型載入 ---
+        let mesh; 
+        updateStatus('正在載入 3D 模型...');
+        const loader = new THREE.STLLoader();
+        loader.load('model.stl', 
+            (geometry) => {
+                updateStatus('模型載入成功');
+                const material = new THREE.MeshPhongMaterial({ color: 0xAFAFAF, specular: 0x010101, shininess: 100 });
+                mesh = new THREE.Mesh(geometry, material);
+                mesh.position.set(0, 0, 0); 
+                mesh.rotation.set(-Math.PI / 2, 0, 0); 
+                mesh.scale.set(1.0, 1.0, 1.0); 
+                scene.add(mesh);
+            },
+            (xhr) => updateStatus(`模型載入中: ${(xhr.loaded / xhr.total * 100).toFixed(0)}%`),
+            (error) => updateStatus('模型載入失敗，請檢查檔案路徑')
+        );
+
+        // --- 環境光與平行光 ---
+        scene.add(new THREE.AmbientLight(0x404040));
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
+        scene.add(directionalLight);
+
+        function updateSunPosition() {
+            const date = new Date();
+            const hours = date.getHours() + date.getMinutes() / 60;
+            if (hours >= 6 && hours <= 18) {
+                const angle = ((hours - 6) / 12) * Math.PI;
+                directionalLight.position.set(Math.cos(angle) * 10, Math.sin(angle) * 10, 5);
+                directionalLight.intensity = Math.sin(angle) * 0.8 + 0.2;
+                renderer.setClearColor(0x87ceeb);
+            } else {
+                const nightAngle = ((hours > 18 ? hours - 18 : hours + 6) / 12) * Math.PI;
+                directionalLight.position.set(Math.cos(nightAngle) * 10, Math.sin(nightAngle) * 5, 5);
+                directionalLight.intensity = 0.1;
+                renderer.setClearColor(0x000033);
+            }
+        }
+        updateSunPosition();
+        setInterval(updateSunPosition, 60000);
+
+        // --- GPS 定位與追蹤 ---
+        const modelInitialCoords = { lat: 25.041454, lon: 121.533070 };
+        const toRad = (deg) => deg * Math.PI / 180;
+        const toDeg = (rad) => rad * 180 / Math.PI;
+        
+        function calculateDistance(coords1, coords2) {
+            const R = 6371e3; // 地球半徑 (公尺)
+            const phi1 = toRad(coords1.lat);
+            const phi2 = toRad(coords2.lat);
+            const deltaPhi = toRad(coords2.lat - coords1.lat);
+            const deltaLambda = toRad(coords2.lon - coords1.lon);
+
+            const a = Math.sin(deltaPhi / 2) * Math.sin(deltaPhi / 2) +
+                      Math.cos(phi1) * Math.cos(phi2) *
+                      Math.sin(deltaLambda / 2) * Math.sin(deltaLambda / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return R * c;
+        }
+        
+        function calculateBearing(startPoint, endPoint) {
+            const lat1 = toRad(startPoint.lat);
+            const lon1 = toRad(startPoint.lon);
+            const lat2 = toRad(endPoint.lat);
+            const lon2 = toRad(endPoint.lon);
+            const deltaLon = lon2 - lon1;
+            const y = Math.sin(deltaLon) * Math.cos(lat2);
+            const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(deltaLon);
+            let bearing = toDeg(Math.atan2(y, x));
+            return (bearing + 360) % 360; // 標準化為 0-360 度
+        }
+
+        if ('geolocation' in navigator) {
+            updateStatus('正在等待 GPS 訊號...');
+            navigator.geolocation.watchPosition(
+                (position) => {
+                    if (!mesh) { return; }
+                    const userCoords = { lat: position.coords.latitude, lon: position.coords.longitude };
+                    const distance = calculateDistance(userCoords, modelInitialCoords);
+                    const bearing = calculateBearing(userCoords, modelInitialCoords);
+                    const bearingRad = toRad(bearing);
+                    mesh.position.x = distance * Math.sin(bearingRad);
+                    mesh.position.z = -distance * Math.cos(bearingRad);
+                    updateStatus(`GPS 更新：距離模型 ${distance.toFixed(0)} 公尺，方位 ${bearing.toFixed(0)}°`);
+                },
+                (error) => updateStatus('無法持續取得 GPS 位置'),
+                { enableHighAccuracy: true, maximumAge: 0, timeout: 5000 }
+            );
+        } else {
+            updateStatus('瀏覽器不支援 GPS 定位');
+        }
+
+        // --- 控制模式切換與事件監聽 ---
+        function enableManualControls() {
+            if (controlMode === 'manual') return;
+            controlMode = 'manual';
+            updateStatus('陀螺儀無法使用，請滑動螢幕來調整視角');
+            window.removeEventListener('deviceorientation', onDeviceOrientation);
+            renderer.domElement.addEventListener('pointerdown', onPointerDown);
+            renderer.domElement.addEventListener('pointermove', onPointerMove);
+            renderer.domElement.addEventListener('pointerup', onPointerUp);
+            renderer.domElement.addEventListener('pointerleave', onPointerUp);
+        }
+
+        const gyroDetectTimeout = setTimeout(enableManualControls, 3000); // 增加等待時間
+
+        // --- 陀螺儀控制 ---
+        let deviceOrientation = {}; // 用於儲存最新的陀螺儀數據
+        const zee = new THREE.Vector3(0, 0, 1);
+        const euler = new THREE.Euler();
+        const q0 = new THREE.Quaternion();
+        const q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)); // -90度繞X軸
+
+        function onDeviceOrientation(event) {
+            if (!event.alpha) return;
+
+            // 這是新加的檢查
+            // 如果我們被迫使用標準事件，檢查 absolute 標記
+            if (event.absolute === false) {
+                 updateStatus('警告：陀螺儀不包含指北針，方位可能不準確');
+            }
+
+            clearTimeout(gyroDetectTimeout);
+            deviceOrientation = event; // 只儲存事件，計算在 animate 迴圈中進行
+        }
+        
+        // --- 手動控制函式 ---
+        function onPointerDown(event) {
+            isDragging = true;
+            previousPointerPosition.x = event.clientX;
+            previousPointerPosition.y = event.clientY;
+        }
+
+        function onPointerMove(event) {
+            if (!isDragging) return;
+
+            const deltaX = event.clientX - previousPointerPosition.x;
+            const deltaY = event.clientY - previousPointerPosition.y;
+            
+            // 左右旋轉 (Yaw)
+            yawObject.rotation.y -= deltaX * 0.005;
+            // 上下旋轉 (Pitch)，並限制在上下 90 度之間
+            camera.rotation.x -= deltaY * 0.005;
+            camera.rotation.x = Math.max(-PI_2, Math.min(PI_2, camera.rotation.x));
+            
+            previousPointerPosition.x = event.clientX;
+            previousPointerPosition.y = event.clientY;
+        }
+        
+        function onPointerUp() {
+            isDragging = false;
+        }
+        
+        // --- 啟動控制 ---
+
+        function startExperience() {
+            // 隱藏權限請求畫面
+            const overlay = document.getElementById('permission-overlay');
+            if (overlay) {
+                overlay.style.display = 'none';
+            }
+
+            // 檢查並請求 iOS 13+ 的權限
+            if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                DeviceOrientationEvent.requestPermission()
+                    .then(permissionState => {
+                        if (permissionState === 'granted') {
+                            updateStatus('方向感測器權限已授予');
+                            listenForOrientation();
+                        } else {
+                            updateStatus('方向感測器權限被拒絕');
+                            enableManualControls();
+                        }
+                    })
+                    .catch((error) => {
+                         console.error(error);
+                         updateStatus('請求權限時發生錯誤');
+                         enableManualControls();
+                    });
+            } else {
+                // 非 iOS 13+ 的設備，直接開始監聽
+                listenForOrientation();
+            }
+        }
+
+        function listenForOrientation() {
+            // 優先嘗試 'deviceorientationabsolute'
+            if ('ondeviceorientationabsolute' in window) {
+                updateStatus('正在使用絕對方向模式 (指北針)');
+                window.addEventListener('deviceorientationabsolute', onDeviceOrientation, true);
+            } 
+            // 如果不行，再使用標準的 'deviceorientation'
+            else if ('ondeviceorientation' in window) {
+                updateStatus('正在使用標準方向模式');
+                window.addEventListener('deviceorientation', onDeviceOrientation, true);
+            } 
+            // 如果完全不支援，切換到手動模式
+            else {
+                updateStatus('此裝置不支援方向感測器');
+                enableManualControls();
+            }
+        }
+        
+        // 綁定按鈕事件
+        const permissionBtn = document.getElementById('permission-btn');
+        permissionBtn.addEventListener('click', startExperience);
+        
+        // --- 動畫迴圈 ---
+        function updateCameraOrientation() {
+            if (controlMode !== 'gyro' || !deviceOrientation.alpha) {
+                return; // 如果不是陀螺儀模式，或還沒有數據，就跳過
+            }
+
+            const alpha = THREE.MathUtils.degToRad(deviceOrientation.alpha); // Y-axis (Compass)
+            const beta = THREE.MathUtils.degToRad(deviceOrientation.beta);   // X-axis (Pitch)
+            const gamma = THREE.MathUtils.degToRad(deviceOrientation.gamma); // Z-axis (Roll)
+            const orient = THREE.MathUtils.degToRad(window.orientation || 0); // Screen Orientation
+
+            // 使用 'YXZ' 順序建立 Euler 角
+            euler.set(beta, alpha, -gamma, 'YXZ');
+
+            // q0 現在是裝置的原始方向
+            q0.setFromEuler(euler);
+
+            // 根據螢幕是直向還是橫向進行修正
+            q0.multiply(q1);
+
+            // 根據螢幕旋轉角度進行最後修正
+            q0.multiply(new THREE.Quaternion().setFromAxisAngle(zee, -orient));
+
+            // 將最終計算出的方向應用到相機上
+            camera.quaternion.copy(q0);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // 在每一幀都更新相機方向
+            updateCameraOrientation(); 
+
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // --- 視窗大小調整 ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
