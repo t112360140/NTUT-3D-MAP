@@ -29,7 +29,7 @@ function updateStatus(message) {
 let mesh; 
 updateStatus('正在載入 3D 模型...');
 const loader = new THREE.STLLoader();
-loader.load('./models/model.stl', 
+loader.load('./models/MAP.stl', 
     (geometry) => {
         updateStatus('模型載入成功');
         const material = new THREE.MeshPhongMaterial({ color: 0xAFAFAF, specular: 0x010101, shininess: 100 });
